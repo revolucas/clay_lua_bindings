@@ -88,6 +88,75 @@ function layout(dt, mx, my, mouseDown, wheelY)
 end
 ```
 
+## **Open/Configure/Close API (explicit element blocks)**
+
+In addition to createElement(id, config?, childrenFn?), you can drive layout with three explicit calls:
+```clay.open(clay.id("MyBox"))        -- begin an element block
+clay.configure({
+  layout = {
+    layoutDirection = clay.TOP_TO_BOTTOM,
+    sizing = { width = clay.sizingGrow(), height = clay.sizingFixed(160) },
+    padding = clay.paddingAll(12),
+    childGap = 8,
+  },
+  backgroundColor = { r=28, g=32, b=40, a=255 },
+  cornerRadius = { topLeft=8, topRight=8, bottomLeft=8, bottomRight=8 },
+})
+-- (declare children here with more open/configure/close or createTextElement, etc.)
+clay.close()                       -- end the element block
+```
+
+## Why use it?
+- **Clarity & control:** Separates ID, configuration, and the child body. Handy for step-wise config (e.g., conditionally toggling `clip`, `floating`, borders, etc.).
+- **Interleave logic:** You can compute sizes or colors between `open` and `configure` based on runtime state.
+
+## Call order rules
+1. `clay.open(id)` starts a new element.
+2. `clay.configure(tbl?)` is optional and can be called once for that open element.
+3. `clay.close()` must be called exactly once to end the element.
+4. You may nest elements by calling `open` again before closing the parent; just ensure every `open` has a matching `close`.
+5. You cannot call `configure` after `close`, and you cannot `open` a sibling without closing the current element first.
+> Tip: If you prefer a single call with inlined children, keep using `createElement`. The explicit API is equivalent, just less overhead.
+
+## Scroll/clip behavior
+- Unlike with `createElement`, it should be okay to use `getScrollOffset` with `clip` through `configure`. The issue with `createElement` is because the element is not yet open when calling `getScrollOffset`.
+
+## Mixed usage example
+You can freely mix `open/configure/close` with `createTextElement` and other helpers:
+```clay.open(clay.id("Card"))
+clay.configure({
+  layout = {
+    layoutDirection = clay.TOP_TO_BOTTOM,
+    sizing = { width = clay.sizingPercent(1.0), height = clay.sizingFit() },
+    padding = clay.paddingAll(10), childGap = 6,
+  },
+  backgroundColor = { r=46, g=50, b=62, a=255 },
+  cornerRadius = { topLeft=10, topRight=10, bottomLeft=10, bottomRight=10 },
+})
+
+  clay.open(clay.id("Header"))
+  clay.configure({ layout = { sizing = { width = clay.sizingGrow(), height = clay.sizingFixed(28) } } })
+    clay.createTextElement("Title", { fontId=1, fontSize=18 })
+  clay.close()
+
+  clay.open(clay.id("Body"))
+  clay.configure({
+    layout = { sizing = { width = clay.sizingGrow(), height = clay.sizingFit() }, childGap = 4 }
+  })
+    for i = 1, 3 do
+      clay.open(clay.id("Row", i))
+      clay.configure({
+        layout = { sizing = { width = clay.sizingGrow(), height = clay.sizingFixed(24) }, padding = clay.paddingLTRB(8,4,8,4) },
+        backgroundColor = { r=58, g=62, b=74, a=255 },
+      })
+        clay.createTextElement(("Item %d"):format(i), { fontId=1, fontSize=14 })
+      clay.close()
+    end
+  clay.close()
+
+clay.close()
+```
+
 ---
 
 ## **The Layout End Iterator (robust overview)**

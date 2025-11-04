@@ -513,6 +513,327 @@ static int l_Clay_CreateElement(lua_State *L) {
     return 1;
 }
 
+// Manually open element by id
+static int l_Clay_OpenElement(lua_State *L) {
+    // -------------------------------------------------------------------------
+    // FIRST PARAMETER: id table like { "LabelString", 0 }
+    if (!lua_istable(L, 1))
+        return luaL_error(L, "open(idTable) requires first argument from clay.id()");
+
+	//id
+    lua_rawgeti(L, 1, 1);
+    uint32_t id = 0;
+    if (lua_isnumber(L, -1))
+        id = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
+	//offset
+    lua_rawgeti(L, 1, 2);
+    uint32_t offset = 0;
+    if (lua_isnumber(L, -1))
+        offset = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    
+	//baseId
+    lua_rawgeti(L, 1, 3);
+    uint32_t baseId = 0;
+    if (lua_isnumber(L, -1))
+        baseId = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    
+    //stringId
+    lua_rawgeti(L, 1, 4);
+    if (!lua_isstring(L, -1))
+        return luaL_error(L, "table[4] must be a string");
+    const char *label = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    
+	Clay_Context* ctx = Clay_GetCurrentContext();
+	if (!ctx) {
+		luaL_error(L, "Clay context is null (did you call clay.initialize()?)");
+	}
+	
+	Clay_String luaStr = { .chars = label, .length = (int32_t)strlen(label), .isStaticallyAllocated = false };
+	Clay_String s = Clay__WriteStringToCharBuffer(&ctx->dynamicStringData, luaStr);
+
+    Clay_ElementId elid = (Clay_ElementId){id, offset, baseId, s};
+
+	
+	// Open Element
+	Clay__OpenElementWithId(elid);
+	
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// Manually configure last opened element
+static int l_Clay_ConfigureElement(lua_State *L) {
+    Clay_ElementDeclaration decl = { 0 };
+    decl.layout = CLAY_LAYOUT_DEFAULT;
+	
+    // CONFIG TABLE
+    if (lua_istable(L, 1)) {
+
+        // ---------------- layout ----------------
+        lua_getfield(L, 1, "layout");
+        if (lua_istable(L, -1)) {
+
+            // layoutDirection
+            lua_getfield(L, -1, "layoutDirection");
+            if (lua_isnumber(L, -1))
+                decl.layout.layoutDirection = (int)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+
+            // childGap
+            lua_getfield(L, -1, "childGap");
+            if (lua_isnumber(L, -1))
+                decl.layout.childGap = (float)lua_tonumber(L, -1);
+            lua_pop(L, 1);
+
+			// childAlignment = { x = clay.ALIGN_X_LEFT, y = clay.ALIGN_Y_CENTER }
+			lua_getfield(L, -1, "childAlignment");
+			if (lua_istable(L, -1)) {
+				lua_getfield(L, -1, "x");
+				if (lua_isnumber(L, -1))
+					decl.layout.childAlignment.x = (Clay_LayoutAlignmentX)lua_tointeger(L, -1);
+				lua_pop(L, 1);
+
+				lua_getfield(L, -1, "y");
+				if (lua_isnumber(L, -1))
+					decl.layout.childAlignment.y = (Clay_LayoutAlignmentY)lua_tointeger(L, -1);
+				lua_pop(L, 1);
+			}
+			lua_pop(L, 1);
+
+            // padding
+            lua_getfield(L, -1, "padding");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "left");   decl.layout.padding.left   = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "right");  decl.layout.padding.right  = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "top");    decl.layout.padding.top    = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "bottom"); decl.layout.padding.bottom = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+
+            // sizing
+            lua_getfield(L, -1, "sizing");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "width");
+                if (lua_istable(L, -1))
+                    readSizingAxisFromLua(L, lua_gettop(L), &decl.layout.sizing.width);
+                else if (lua_isnumber(L, -1)) {
+                    float w = (float)lua_tonumber(L, -1);
+                    decl.layout.sizing.width.type = CLAY__SIZING_TYPE_FIXED;
+                    decl.layout.sizing.width.size.minMax.min = w;
+                    decl.layout.sizing.width.size.minMax.max = w;
+                }
+                lua_pop(L, 1);
+
+                lua_getfield(L, -1, "height");
+                if (lua_istable(L, -1))
+                    readSizingAxisFromLua(L, lua_gettop(L), &decl.layout.sizing.height);
+                else if (lua_isnumber(L, -1)) {
+                    float h = (float)lua_tonumber(L, -1);
+                    decl.layout.sizing.height.type = CLAY__SIZING_TYPE_FIXED;
+                    decl.layout.sizing.height.size.minMax.min = h;
+                    decl.layout.sizing.height.size.minMax.max = h;
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1); // layout
+
+        // ---------------- backgroundColor ----------------
+        lua_getfield(L, 1, "backgroundColor");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "r"); decl.backgroundColor.r = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+            lua_getfield(L, -1, "g"); decl.backgroundColor.g = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+            lua_getfield(L, -1, "b"); decl.backgroundColor.b = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+            lua_getfield(L, -1, "a"); decl.backgroundColor.a = (float)luaL_optnumber(L, -1, 255); lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+
+        // ---------------- cornerRadius ----------------
+        lua_getfield(L, 1, "cornerRadius");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "topLeft");     decl.cornerRadius.topLeft     = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            lua_getfield(L, -1, "topRight");    decl.cornerRadius.topRight    = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            lua_getfield(L, -1, "bottomLeft");  decl.cornerRadius.bottomLeft  = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            lua_getfield(L, -1, "bottomRight"); decl.cornerRadius.bottomRight = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+
+		// ---------------- border ----------------
+		lua_getfield(L, 1, "border");
+		if (lua_istable(L, -1)) {
+			// border.color = { r, g, b, a }
+			lua_getfield(L, -1, "color");
+			if (lua_istable(L, -1)) {
+				lua_getfield(L, -1, "r"); decl.border.color.r = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "g"); decl.border.color.g = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "b"); decl.border.color.b = (float)luaL_optnumber(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "a"); decl.border.color.a = (float)luaL_optnumber(L, -1, 255); lua_pop(L, 1);
+			}
+			lua_pop(L, 1);
+
+			// border.width = { left, right, top, bottom }
+			lua_getfield(L, -1, "width");
+			if (lua_istable(L, -1)) {
+				lua_getfield(L, -1, "left");   decl.border.width.left   = (uint16_t)luaL_optinteger(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "right");  decl.border.width.right  = (uint16_t)luaL_optinteger(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "top");    decl.border.width.top    = (uint16_t)luaL_optinteger(L, -1, 0); lua_pop(L, 1);
+				lua_getfield(L, -1, "bottom"); decl.border.width.bottom = (uint16_t)luaL_optinteger(L, -1, 0); lua_pop(L, 1);
+			}
+			lua_pop(L, 1);
+		}
+		lua_pop(L, 1);
+
+        // ---------------- image ----------------
+        lua_getfield(L, 1, "image");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "imageData");
+            decl.image.imageData = lua_islightuserdata(L, -1) ? lua_touserdata(L, -1) : NULL;
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        
+                // ---------------- aspectRatio ----------------
+        // Accept either a table { aspectRatio = 1.78 } or a raw number 1.78
+        lua_getfield(L, 1, "aspectRatio");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "aspectRatio");
+            if (lua_isnumber(L, -1)) {
+                decl.aspectRatio.aspectRatio = (float)lua_tonumber(L, -1);
+            }
+            lua_pop(L, 1);
+        } else if (lua_isnumber(L, -1)) {
+            decl.aspectRatio.aspectRatio = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // ---------------- clip ----------------
+        // { horizontal=true|false, vertical=true|false, childOffset={x=..., y=...} }
+        lua_getfield(L, 1, "clip");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "horizontal");
+            decl.clip.horizontal = lua_toboolean(L, -1);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "vertical");
+            decl.clip.vertical = lua_toboolean(L, -1);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "childOffset");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "x"); decl.clip.childOffset.x = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "y"); decl.clip.childOffset.y = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                
+            // This is important. Clay_GetScrollOffset() will not work from lua because it's called before element open, 
+            // instead we just default to it if omitted
+            } else if (decl.clip.horizontal || decl.clip.vertical) {
+				decl.clip.childOffset = Clay_GetScrollOffset();
+			}
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+
+        // ---------------- floating ----------------
+        // {
+        //   offset={x,y}, expand={width,height}, parentId=uint32,
+        //   zIndex=int16, attachPoints={ element=CLAY_ATTACH_POINT_*, parent=CLAY_ATTACH_POINT_* },
+        //   pointerCaptureMode=CLAY_POINTER_CAPTURE_MODE_*, attachTo=CLAY_ATTACH_TO_*,
+        //   clipTo=CLAY_CLIP_TO_*
+        // }
+        lua_getfield(L, 1, "floating");
+        if (lua_istable(L, -1)) {
+            // offset
+            lua_getfield(L, -1, "offset");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "x"); decl.floating.offset.x = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "y"); decl.floating.offset.y = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+
+            // expand
+            lua_getfield(L, -1, "expand");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "width");  decl.floating.expand.width  = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+                lua_getfield(L, -1, "height"); decl.floating.expand.height = (float)luaL_optnumber(L, -1, 0.0); lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+
+            // parentId
+            lua_getfield(L, -1, "parentId");
+            if (lua_isnumber(L, -1)) { decl.floating.parentId = (uint32_t)lua_tointeger(L, -1); }
+            lua_pop(L, 1);
+
+            // zIndex
+            lua_getfield(L, -1, "zIndex");
+            if (lua_isnumber(L, -1)) { decl.floating.zIndex = (int16_t)lua_tointeger(L, -1); }
+            lua_pop(L, 1);
+
+            // attachPoints
+            lua_getfield(L, -1, "attachPoints");
+            if (lua_istable(L, -1)) {
+                lua_getfield(L, -1, "element");
+                if (lua_isnumber(L, -1)) decl.floating.attachPoints.element = (int)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+
+                lua_getfield(L, -1, "parent");
+                if (lua_isnumber(L, -1)) decl.floating.attachPoints.parent = (int)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+
+            // pointerCaptureMode
+            lua_getfield(L, -1, "pointerCaptureMode");
+            if (lua_isnumber(L, -1)) decl.floating.pointerCaptureMode = (int)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+
+            // attachTo
+            lua_getfield(L, -1, "attachTo");
+            if (lua_isnumber(L, -1)) decl.floating.attachTo = (int)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+
+            // clipTo
+            lua_getfield(L, -1, "clipTo");
+            if (lua_isnumber(L, -1)) decl.floating.clipTo = (int)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+
+        // ---------------- custom ----------------
+        // { customData = lightuserdata }
+        lua_getfield(L, 1, "custom");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "customData");
+            decl.custom.customData = lua_islightuserdata(L, -1) ? lua_touserdata(L, -1) : NULL;
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+
+        // ---------------- userData ----------------
+        lua_getfield(L, 1, "userData");
+        if (lua_islightuserdata(L, -1)) {
+            decl.userData = lua_touserdata(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    //Clay__ConfigureOpenElementPtr(&decl);
+    Clay__ConfigureOpenElement(CLAY__CONFIG_WRAPPER(Clay_ElementDeclaration, decl));
+    
+    return 0;
+}
+
+//Manually close the active element
+static int l_Clay_CloseElement(lua_State *L) {
+	Clay__CloseElement();
+	return 0;
+}
+
 static int l_Clay_CreateTextElement(lua_State *L) {
 	Clay_String s = Clay_CopyLuaString(L, 1);
 	
@@ -1322,7 +1643,9 @@ int luaopen_clay(lua_State *L) {
     lua_pushcfunction(L, l_Clay_CreateTextElement); lua_setfield(L, -2, "createTextElement");
     lua_pushcfunction(L, l_Clay_Id); lua_setfield(L, -2, "id");
     lua_pushcfunction(L, l_Clay_GetLastElementId); lua_setfield(L, -2, "getLastElementId");
-    
+    lua_pushcfunction(L, l_Clay_OpenElement); lua_setfield(L, -2, "open");
+    lua_pushcfunction(L, l_Clay_ConfigureElement); lua_setfield(L, -2, "configure");
+    lua_pushcfunction(L, l_Clay_CloseElement); lua_setfield(L, -2, "close");
     lua_pushcfunction(L, l_Clay_GetElementId); lua_setfield(L, -2, "getElementId");
     lua_pushcfunction(L, l_Clay_GetElementIdWithIndex); lua_setfield(L, -2, "getElementIdWithIndex");
 
