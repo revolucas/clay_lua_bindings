@@ -214,6 +214,198 @@ These methods exist on each yielded `cmd` (use method syntax `cmd:method()`):
 
 **Important**: A method that doesn’t apply to the current command type returns nothing (`nil` in Lua). Always branch on `cmd:type()` before calling type-specific accessors.
 
+# Passing data through render commands (`userData`, `imageData`, `customData`)
+
+You can attach **arbitrary payloads** to elements and read them back from the **render commands** in your draw loop. The wrapper supports two forms:
+
+1) **Lightuserdata pointer** (zero-copy, stays a pointer)  
+2) **Any Lua value** (table/string/number/function/cdata/etc.) — stored internally as a registry ref and restored on read
+
+## How to set data on an element
+
+```lua
+-- image.imageData (for IMAGE commands)
+clay.open(clay.id("Avatar"))
+clay.configure({
+  image = {
+    -- Option A: pass a C/FFI pointer (stays lightuserdata)
+    imageData = my_texture_ptr,
+
+    -- You can still style the image via backgroundColor/cornerRadius/etc.
+  },
+})
+clay.close()
+
+-- custom.customData (for CUSTOM commands your renderer handles)
+clay.open(clay.id("CustomBox"))
+clay.configure({
+  custom = {
+    -- Option B: pass ANY Lua value (table, string, function, etc.)
+    customData = { type = "sparkle", intensity = 0.8 },
+  },
+})
+clay.close()
+
+-- top-level userData (available on EVERY command produced by this element)
+clay.open(clay.id("Row42"))
+clay.configure({
+  userData = { row = 42, key = items[42].id },  -- any Lua value OR a lightuserdata
+})
+  clay.createTextElement(items[42].label, { fontId = 1, fontSize = 14 })
+clay.close()
+```
+
+- `image.imageData` → appears on `RENDER_IMAGE` commands
+- `custom.customData` → appears on `RENDER_CUSTOM` commands
+- `userData` (top-level) → copied onto **every** render command emitted for that element (rect, border, text, etc.)
+
+## How to read data during rendering
+
+Inside your draw loop (layout end iterator):
+
+```lua
+for cmd in clay.endLayoutIter() do
+  local t = cmd:type()
+
+  -- imageData for IMAGE
+  if t == clay.RENDER_IMAGE then
+    local payload = cmd:imageData()   -- may return lightuserdata OR the original Lua value
+    -- NOTE: one-shot; calling cmd:imageData() again this frame returns nil
+    draw_image(cmd, payload)
+  end
+
+  -- customData for CUSTOM
+  if t == clay.RENDER_CUSTOM then
+    local payload = cmd:customData()  -- one-shot
+    draw_custom(cmd, payload)
+  end
+
+  -- userData for any command type
+  do
+    local u = cmd:userData()          -- one-shot
+    if u then use_per_command_user_data(u) end
+  end
+end
+```
+
+### One-shot semantics (important!)
+When you **set a non-lightuserdata Lua value**, the wrapper stores it as a **Lua registry reference** behind the scenes. On the **first** call to `cmd:imageData()`, `cmd:customData()`, or `cmd:userData()`:
+
+- The wrapper **restores the original Lua value**,  
+- **Unrefs** the registry entry to avoid leaks,  
+- **Nulls out** the internal pointer for that command.
+
+So a **second call** in the **same frame** will return `nil`. If you need the value in multiple places, cache it in a local variable on first read.
+
+> If you pass a **lightuserdata pointer**, the wrapper returns that pointer each time (it doesn’t consume it), and you won’t hit the one-shot behavior.
+
+## Choosing between pointer vs Lua value
+
+- **Use lightuserdata** when you already have a native pointer (e.g., a texture handle, shader, mesh). This keeps the hot path zero-allocation and avoids GC.  
+- **Use Lua values** when you want to ship structured params to your renderer without building C structs (e.g., `{ kind="badge", color=... }`).
+
+## Per-field behavior summary
+
+| Field on element config | Command accessor        | Applies to command types           | Accepted input                       | Return value in renderer | Notes |
+|---|---|---|---|---|---|
+| `image.imageData`       | `cmd:imageData()`       | `RENDER_IMAGE`                     | lightuserdata **or** any Lua value   | pointer or original Lua  | Lua value is **one-shot** |
+| `custom.customData`     | `cmd:customData()`      | `RENDER_CUSTOM`                    | lightuserdata **or** any Lua value   | pointer or original Lua  | Lua value is **one-shot** |
+| `userData` (top-level)  | `cmd:userData()`        | **All commands** from that element | lightuserdata **or** any Lua value   | pointer or original Lua  | Lua value is **one-shot** |
+
+## Practical patterns
+
+- **Batching**: stash a small tag in `userData` (e.g., `{bucket="ui"}`) so your renderer can group commands without extra lookups.  
+- **Images**: put your engine’s texture handle in `image.imageData` (lightuserdata) for direct use in the renderer.  
+- **Custom draws**: encode draw parameters in `custom.customData` as a Lua table; your renderer reads it on the `RENDER_CUSTOM` and performs the specialized draw.  
+- **Avoid accidental consumption**: call each accessor **once** per command and cache the result if multiple systems need it.
+
+## Gotchas & tips
+
+- **Don’t rely on multiple reads** of the same Lua payload in one frame—cache it.  
+- **Be mindful of GC**: passing large tables per command can create pressure. Prefer small tables, interned strings, or pointers.  
+- **Separate concerns**: use `userData` for per-element metadata; keep heavy per-draw payloads in `imageData`/`customData` only on commands that need them.  
+- **Works with both `createElement` and `open/configure/close`** APIs. The behavior is identical.
+
+---
+
+# LuaJIT cdata support (`userData`, `imageData`, `customData`)
+
+When you build the wrapper with **LuaJIT**, you can pass **cdata** (FFI pointers, structs, etc.) into the three payload fields. The wrapper treats cdata as a regular Lua value and preserves it end-to-end.
+
+### What you can pass
+- `image.imageData = <cdata or lightuserdata or any Lua value>`
+- `custom.customData = <cdata or lightuserdata or any Lua value>`
+- `userData = <cdata or lightuserdata or any Lua value>`
+
+### How it behaves
+- **cdata counts as a “Lua value” path** (like a table/string/number). Internally it’s stored as a registry ref and **restored exactly** on read.
+- Therefore, reading via `cmd:imageData()`, `cmd:customData()`, or `cmd:userData()` is **one-shot per command per frame** (the wrapper unrefs the value and nulls the pointer after the first read).
+- If you need the value multiple times, **cache it** the first time you read it.
+
+### Example: pass an FFI pointer
+```lua
+local ffi = require("ffi")
+
+-- Suppose your renderer created a native texture handle in C
+-- and exposed it to Lua as an FFI pointer:
+local tex = ffi.cast("void*", my_engine_get_texture("avatar.png"))
+
+clay.open(clay.id("Avatar"))
+clay.configure({
+  image = {
+    imageData = tex,               -- cdata pointer OK
+  },
+  cornerRadius = { topLeft=8, topRight=8, bottomLeft=8, bottomRight=8 },
+})
+clay.close()
+
+for cmd in clay.endLayoutIter() do
+  if cmd:type() == clay.RENDER_IMAGE then
+    local payload = cmd:imageData()   -- returns the SAME cdata you passed
+    -- NOTE: one-shot; calling cmd:imageData() again returns nil
+    draw_image_with_pointer(cmd, payload)
+  end
+end
+```
+
+### Example: pass a struct with draw params
+```lua
+local ffi = require("ffi")
+ffi.cdef[[
+typedef struct { float radius; float softness; } Glow;
+]]
+local glow = ffi.new("Glow", { radius = 12.0, softness = 0.6 })
+
+clay.open(clay.id("GlowBox"))
+clay.configure({
+  custom = { customData = glow },   -- cdata struct OK
+})
+clay.close()
+
+for cmd in clay.endLayoutIter() do
+  if cmd:type() == clay.RENDER_CUSTOM then
+    local g = cmd:customData()      -- Glow* (cdata) on first call
+    if g then render_glow(cmd, g.radius, g.softness) end
+  end
+end
+```
+
+### Choosing cdata vs lightuserdata
+- **cdata (LuaJIT FFI)**  
+  - Pro: you can pass typed pointers or structs directly; great for rich params.  
+  - Con: treated as a Lua value → **one-shot accessor**; also participates in GC like any other Lua object.
+- **lightuserdata (plain Lua pointer)**  
+  - Pro: **not** consumed on read; the accessor can be called repeatedly without turning `nil`.  
+  - Con: untyped; you carry type info out-of-band in your renderer.
+
+> If you want “persistent pointer” semantics (multiple reads, zero GC), prefer **lightuserdata**. If you want rich typed parameters or a convenient struct, use **cdata** and cache on first read.
+
+### Tips & pitfalls
+- **Cache once**: multiple systems need the payload? Read it once and reuse the local variable.  
+- **Keep it small**: for lists with thousands of commands, prefer a small struct or pointer (avoid huge tables).  
+- **Mix & match**: use `userData` for per-element tags (e.g., row index), and `imageData` / `customData` for per-command draw inputs.  
+- **Safety**: ensure your renderer doesn’t dereference stale pointers; the wrapper doesn’t retain or copy your native memory.
+
 ### Constants exported for convenience
 - Render types: `RENDER_RECTANGLE`, `RENDER_BORDER`, `RENDER_TEXT`, `RENDER_IMAGE`, `RENDER_SCISSOR_START`, `RENDER_SCISSOR_END`, `RENDER_CUSTOM`.
 - Layout direction: `LEFT_TO_RIGHT`, `TOP_TO_BOTTOM`.
