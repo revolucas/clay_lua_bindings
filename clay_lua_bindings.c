@@ -411,6 +411,43 @@ static void clay_read_element_declaration(lua_State *L, int tbl_index, Clay_Elem
     lua_pop(L, 1);
 }
 
+static Clay_ElementId clay_check_element_id(lua_State *L, int idx)
+{
+    Clay_ElementId eid = (Clay_ElementId){0};
+    idx = lua_absindex(L, idx);
+
+    if (!lua_istable(L, idx)) {
+        luaL_error(L, "expected id table from clay.id()");
+    }
+
+    // id (required)
+    lua_getfield(L, idx, "id");
+    eid.id = (uint32_t)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+
+    // offset (optional)
+    lua_getfield(L, idx, "offset");
+    eid.offset = (uint32_t)luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+
+    // baseId (optional)
+    lua_getfield(L, idx, "baseId");
+    eid.baseId = (uint32_t)luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+
+    // stringId (optional)
+    lua_getfield(L, idx, "stringId");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        // If your Clay API wants a copied Clay_String, use your existing copy helper:
+        Clay_String s = Clay_CopyLuaString(L, -1);
+        eid.stringId = s;
+    } else {
+        // leave eid.stringId zeroed; treat as absent
+    }
+    lua_pop(L, 1);
+
+    return eid;
+}
 // -----------------------------------------------------------------------------
 // Core API wrappers
 // -----------------------------------------------------------------------------
@@ -444,47 +481,8 @@ static int l_Clay_CreateArenaWithCapacityAndMemory(lua_State *L) {
 // Element creation and management
 // -----------------------------------------------------------------------------
 static int l_Clay_CreateElement(lua_State *L) {
-    // -------------------------------------------------------------------------
-    // FIRST PARAMETER: id table like { "LabelString", 0 }
-    if (!lua_istable(L, 1))
-        return luaL_error(L, "createElement(idTable, config?, callback?) requires first argument from clay.id()");
-
-	//id
-    lua_rawgeti(L, 1, 1);
-    uint32_t id = 0;
-    if (lua_isnumber(L, -1))
-        id = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-	//offset
-    lua_rawgeti(L, 1, 2);
-    uint32_t offset = 0;
-    if (lua_isnumber(L, -1))
-        offset = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    
-	//baseId
-    lua_rawgeti(L, 1, 3);
-    uint32_t baseId = 0;
-    if (lua_isnumber(L, -1))
-        baseId = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    
-    //stringId
-    lua_rawgeti(L, 1, 4);
-    if (!lua_isstring(L, -1))
-        return luaL_error(L, "table[4] must be a string");
-    const char *label = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    
-	Clay_Context* ctx = Clay_GetCurrentContext();
-	if (!ctx) {
-		luaL_error(L, "Clay context is null (did you call clay.initialize()?)");
-	}
-	Clay_String luaStr = { .chars = label, .length = (int32_t)strlen(label), .isStaticallyAllocated = false };
-	Clay_String s = Clay__WriteStringToCharBuffer(&ctx->dynamicStringData, luaStr);
-
-    Clay_ElementId elid = (Clay_ElementId){id, offset, baseId, s};
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
 
     Clay_ElementDeclaration decl = { 0 };
     decl.layout = CLAY_LAYOUT_DEFAULT;
@@ -523,49 +521,8 @@ static int l_Clay_CreateElement(lua_State *L) {
 
 // Manually open element by id
 static int l_Clay_OpenElement(lua_State *L) {
-    // -------------------------------------------------------------------------
-    // FIRST PARAMETER: id table like { "LabelString", 0 }
-    if (!lua_istable(L, 1))
-        return luaL_error(L, "open(idTable) requires first argument from clay.id()");
-
-	//id
-    lua_rawgeti(L, 1, 1);
-    uint32_t id = 0;
-    if (lua_isnumber(L, -1))
-        id = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-	//offset
-    lua_rawgeti(L, 1, 2);
-    uint32_t offset = 0;
-    if (lua_isnumber(L, -1))
-        offset = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    
-	//baseId
-    lua_rawgeti(L, 1, 3);
-    uint32_t baseId = 0;
-    if (lua_isnumber(L, -1))
-        baseId = (uint32_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    
-    //stringId
-    lua_rawgeti(L, 1, 4);
-    if (!lua_isstring(L, -1))
-        return luaL_error(L, "table[4] must be a string");
-    const char *label = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    
-	Clay_Context* ctx = Clay_GetCurrentContext();
-	if (!ctx) {
-		luaL_error(L, "Clay context is null (did you call clay.initialize()?)");
-	}
-	
-	Clay_String luaStr = { .chars = label, .length = (int32_t)strlen(label), .isStaticallyAllocated = false };
-	Clay_String s = Clay__WriteStringToCharBuffer(&ctx->dynamicStringData, luaStr);
-
-    Clay_ElementId elid = (Clay_ElementId){id, offset, baseId, s};
-
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
 	
 	// Open Element
 	Clay__OpenElementWithId(elid);
@@ -646,6 +603,26 @@ static int l_Clay_CreateTextElement(lua_State *L) {
     return 1;
 }
 
+static void clay_push_element_id_table(lua_State *L, Clay_ElementId eid, Clay_String explicit_sid)
+{
+    lua_newtable(L);
+    lua_pushinteger(L, eid.id);     lua_setfield(L, -2, "id");
+    lua_pushinteger(L, eid.offset); lua_setfield(L, -2, "offset");
+    lua_pushinteger(L, eid.baseId); lua_setfield(L, -2, "baseId");
+
+    // Prefer the explicit string (from the call) when provided,
+    // otherwise use eid.stringId if present; else nil.
+    if (explicit_sid.chars && explicit_sid.length > 0) {
+        lua_pushlstring(L, explicit_sid.chars, explicit_sid.length);
+        lua_setfield(L, -2, "stringId");
+    } else if (eid.stringId.chars && eid.stringId.length > 0) {
+        lua_pushlstring(L, eid.stringId.chars, eid.stringId.length);
+        lua_setfield(L, -2, "stringId");
+    } else {
+        lua_pushnil(L); lua_setfield(L, -2, "stringId");
+    }
+}
+
 static int l_Clay_Id(lua_State *L) {
 	Clay_String s = Clay_CopyLuaString(L, 1);
     uint32_t index = (uint32_t)luaL_optinteger(L, 2, 0);
@@ -667,50 +644,35 @@ static int l_Clay_Id(lua_State *L) {
     }
     
     clay__last_id = eid;  // cache for next element
-
-    lua_newtable(L);
-    lua_pushinteger(L, eid.id); lua_rawseti(L, -2, 1);
-    lua_pushinteger(L, eid.offset); lua_rawseti(L, -2, 2);
-    lua_pushinteger(L, eid.baseId); lua_rawseti(L, -2, 3);
-	lua_pushlstring(L, s.chars, s.length); lua_rawseti(L, -2, 4);
+	clay_push_element_id_table(L, eid, s);
 
     return 1;
 }
+
 
 static int l_Clay_GetLastElementId(lua_State *L) {
-	Clay_ElementId eid = clay__last_id;
-    lua_newtable(L);
-    lua_pushinteger(L, eid.id); lua_rawseti(L, -2, 1);
-    lua_pushinteger(L, eid.offset); lua_rawseti(L, -2, 2);
-    lua_pushinteger(L, eid.baseId); lua_rawseti(L, -2, 3);
-	lua_pushlstring(L, eid.stringId.chars, eid.stringId.length); lua_rawseti(L, -2, 4);
+    Clay_ElementId eid = clay__last_id;
+    clay_push_element_id_table(L, eid, (Clay_String){0});
     return 1;
 }
+
 
 static int l_Clay_GetElementId(lua_State *L) {
-	Clay_String s = Clay_CopyLuaString(L, 1);
-
+    Clay_String s = Clay_CopyLuaString(L, 1);
     Clay_ElementId eid = Clay_GetElementId(s);
-    lua_newtable(L);
-    lua_pushinteger(L, eid.id); lua_rawseti(L, -2, 1);
-    lua_pushinteger(L, eid.offset); lua_rawseti(L, -2, 2);
-    lua_pushinteger(L, eid.baseId); lua_rawseti(L, -2, 3);
-	lua_pushlstring(L, eid.stringId.chars, eid.stringId.length); lua_rawseti(L, -2, 4);
+    clay_push_element_id_table(L, eid, (Clay_String){0});
     return 1;
 }
+
 
 static int l_Clay_GetElementIdWithIndex(lua_State *L) {
-	Clay_String s = Clay_CopyLuaString(L, 1);
+    Clay_String s = Clay_CopyLuaString(L, 1);
     uint32_t index = (uint32_t)luaL_checkinteger(L, 2);
-	
     Clay_ElementId eid = Clay_GetElementIdWithIndex(s, index);
-    lua_newtable(L);
-    lua_pushinteger(L, eid.id); lua_rawseti(L, -2, 1);
-    lua_pushinteger(L, eid.offset); lua_rawseti(L, -2, 2);
-    lua_pushinteger(L, eid.baseId); lua_rawseti(L, -2, 3);
-	lua_pushlstring(L, eid.stringId.chars, eid.stringId.length); lua_rawseti(L, -2, 4);
+    clay_push_element_id_table(L, eid, (Clay_String){0});
     return 1;
 }
+
 
 static int l_Clay_BeginLayout(lua_State *L) {
     Clay_BeginLayout();
@@ -1034,8 +996,10 @@ static int l_Clay_GetScrollOffset(lua_State *L) {
 }
 
 static int l_Clay_GetElementData(lua_State *L) {
-    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
-    Clay_ElementData d = Clay_GetElementData((Clay_ElementId){ .id = id });
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
+    
+    Clay_ElementData d = Clay_GetElementData(elid);
     lua_newtable(L);
     lua_pushnumber(L, d.boundingBox.x); lua_setfield(L, -2, "x");
     lua_pushnumber(L, d.boundingBox.y); lua_setfield(L, -2, "y");
@@ -1103,30 +1067,16 @@ static int l_Clay_Hovered(lua_State *L) {
 }
 
 static int l_Clay_PointerOver(lua_State *L) {
-    uint32_t id = (uint32_t)luaL_checkinteger(L, 1);
-    bool over = Clay_PointerOver((Clay_ElementId){ .id = id });
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
+    bool over = Clay_PointerOver(elid);
     lua_pushboolean(L, over);
     return 1;
 }
 
 static int l_Clay_GetScrollContainerData(lua_State *L) {
-	Clay_ElementId elid;
-
-    // param 1: element id table {id, offset, baseId, label}
-    if (!lua_istable(L, 1))
-        return luaL_error(L, "GetScrollContainerData requires an id table from clay.id()");
-
-    lua_rawgeti(L, 1, 1);
-    elid.id = (uint32_t)luaL_checkinteger(L, -1);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 2);
-    elid.offset = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 3);
-    elid.baseId = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
     
     Clay_ScrollContainerData data = Clay_GetScrollContainerData(elid);
 
@@ -1185,23 +1135,8 @@ static int l_Clay_GetScrollContainerData(lua_State *L) {
 
 // Set absolute scroll position for a specific scroll container
 static int l_Clay_SetScrollContainerPosition(lua_State *L) {
-    Clay_ElementId elid;
-
-    // param 1: element id table {id, offset, baseId, label}
-    if (!lua_istable(L, 1))
-        return luaL_error(L, "SetScrollContainerPosition requires an id table from clay.id()");
-
-    lua_rawgeti(L, 1, 1);
-    elid.id = (uint32_t)luaL_checkinteger(L, -1);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 2);
-    elid.offset = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 3);
-    elid.baseId = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
 
     float x = (float)luaL_optnumber(L, 2, 0.0);
     float y = (float)luaL_optnumber(L, 3, 0.0);
@@ -1220,23 +1155,8 @@ static int l_Clay_SetScrollContainerPosition(lua_State *L) {
 
 // clay.setScrollOffset(id, x, y)
 static int l_Clay_SetScrollOffset(lua_State *L) {
-    Clay_ElementId elid;
-
-    // param 1: element id table {id, offset, baseId, label}
-    if (!lua_istable(L, 1))
-        return luaL_error(L, "setScrollOffset(idTable, x, y) requires an id table from clay.id()");
-
-    lua_rawgeti(L, 1, 1);
-    elid.id = (uint32_t)luaL_checkinteger(L, -1);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 2);
-    elid.offset = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-
-    lua_rawgeti(L, 1, 3);
-    elid.baseId = (uint32_t)luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
 
     // params 2 and 3: scroll x, y
     float x = (float)luaL_optnumber(L, 2, 0.0);
@@ -1258,10 +1178,10 @@ static int l_Clay_SetScrollOffset(lua_State *L) {
 }
 
 static int l_Clay_SetScrollPosition(lua_State* L) {
-    Clay_ElementId id;
-    id.id = (uint32_t)luaL_checkinteger(L, 1);
+    // arg 1: id table
+    Clay_ElementId elid = clay_check_element_id(L, 1);
 
-    Clay_ScrollContainerData data = Clay_GetScrollContainerData(id);
+    Clay_ScrollContainerData data = Clay_GetScrollContainerData(elid);
     if (!data.found || !data.scrollPosition) {
         // Optionally print a warning or just silently return
         // printf("Scroll container not found for id %u\n", id.id);
