@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>  // For INFINITY
 
 #ifndef LUA_TCDATA
@@ -19,6 +20,12 @@ static inline int lua_absindex(lua_State *L, int idx) {
     return (idx > 0 || idx <= LUA_REGISTRYINDEX) ? idx : (lua_gettop(L) + idx + 1);
 }
 #endif
+
+// Lua 5.1 / LuaJIT compatibility shims
+#ifndef LUA_OK
+#define LUA_OK 0
+#endif
+
 
 // global arena pointer so we can free it later
 static void* g_ClayArenaMem = NULL;
@@ -48,6 +55,44 @@ static inline int clay_ref_from_tag(void *p) {
 
 static inline void* clay_tag_from_ref(int ref) {
     return (void*)(((uintptr_t)ref << 1) | 1u);  // set tag
+}
+
+// Unref a tagged registry reference stored in a void* field.
+// Safe to call with NULL.
+static inline void clay_unref_tagged(lua_State *L, void **field) {
+    if (!field) return;
+    void *p = *field;
+    if (p && clay_is_ref_tag(p)) {
+        int ref = clay_ref_from_tag(p);
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        *field = NULL;
+    }
+}
+
+// Set a void* field from a Lua value:
+// - nil => NULL
+// - lightuserdata => raw pointer
+// - anything else => store registry ref and tag it into the pointer
+// If overwriting an existing tagged ref, it is unref'd (only safe before transfer to Clay).
+static inline void clay_set_ptr_from_lua(lua_State *L, int value_index, void **field) {
+    value_index = lua_absindex(L, value_index);
+
+    // If we're overwriting a previous un-transferred tagged value, release it.
+    clay_unref_tagged(L, field);
+
+    if (lua_isnil(L, value_index)) {
+        *field = NULL;
+        return;
+    }
+
+    if (lua_islightuserdata(L, value_index)) {
+        *field = lua_touserdata(L, value_index);
+        return;
+    }
+
+    lua_pushvalue(L, value_index);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    *field = clay_tag_from_ref(ref);
 }
 
 // ---- Measure bridge (safe, no baseChars arithmetic, no Clay calls inside) ----
@@ -438,7 +483,6 @@ static Clay_ElementId clay_check_element_id(lua_State *L, int idx)
     // stringId (optional)
     lua_getfield(L, idx, "stringId");
     if (lua_type(L, -1) == LUA_TSTRING) {
-        // If your Clay API wants a copied Clay_String, use your existing copy helper:
         Clay_String s = Clay_CopyLuaString(L, -1);
         eid.stringId = s;
     } else {
@@ -448,6 +492,697 @@ static Clay_ElementId clay_check_element_id(lua_State *L, int idx)
 
     return eid;
 }
+
+// -----------------------------------------------------------------------------
+// Fluent builders API (no table churn)
+// -----------------------------------------------------------------------------
+
+typedef struct {
+    Clay_ElementDeclaration decl;
+    int active;                 // element is currently open
+    int configured;             // decl has been applied to Clay
+    int clipOffsetExplicit;     // childOffset was explicitly set
+} LuaClayElementBuilder;
+
+typedef struct {
+    Clay_String text;
+    Clay_TextElementConfig cfg;
+    int active;
+} LuaClayTextBuilder;
+
+static void text_builder_emit(LuaClayTextBuilder *t) {
+    if (!t || !t->active) return;
+    Clay_TextElementConfig *cfg = CLAY_TEXT_CONFIG((Clay_TextElementConfig){0});
+    *cfg = t->cfg;
+    CLAY_TEXT(t->text, cfg);
+
+    // Detach tagged refs; Clay now owns them until the command is consumed.
+    t->cfg.userData = NULL;
+    t->active = 0;
+ }
+
+static LuaClayElementBuilder* check_elem_builder(lua_State *L, int idx) {
+    return (LuaClayElementBuilder*)luaL_checkudata(L, idx, "ClayElementBuilder");
+}
+
+static LuaClayTextBuilder* check_text_builder(lua_State *L, int idx) {
+    return (LuaClayTextBuilder*)luaL_checkudata(L, idx, "ClayTextBuilder");
+}
+
+static void elem_builder_ensure_open(lua_State *L, LuaClayElementBuilder *b) {
+    if (!b || !b->active) luaL_error(L, "element builder is not active (already closed?)");
+}
+
+static void elem_builder_detach_ptrs(LuaClayElementBuilder *b) {
+    // After we configure into Clay, ownership of tagged registry refs transfers to Clay's render commands.
+    // Detach so __gc won't accidentally unref them.
+    b->decl.userData = NULL;
+    b->decl.image.imageData = NULL;
+    b->decl.custom.customData = NULL;
+}
+
+static void elem_builder_configure_if_needed(lua_State *L, LuaClayElementBuilder *b) {
+    (void)L;
+    if (b->configured) return;
+
+    // Default clip offset behavior (match existing table reader): if clipping and offset omitted, default to scroll offset.
+    if ((b->decl.clip.horizontal || b->decl.clip.vertical) && !b->clipOffsetExplicit) {
+        b->decl.clip.childOffset = Clay_GetScrollOffset();
+    }
+
+    Clay__ConfigureOpenElement(CLAY__CONFIG_WRAPPER(Clay_ElementDeclaration, b->decl));
+    b->configured = 1;
+
+    // IMPORTANT: detach tagged refs so builder doesn't unref them.
+    elem_builder_detach_ptrs(b);
+}
+
+// --- clay.element(...) ---
+static Clay_ElementId clay_element_id_from_args(lua_State *L, int arg1) {
+    int t = lua_type(L, arg1);
+    if (t == LUA_TTABLE) {
+        return clay_check_element_id(L, arg1);
+    }
+    if (t == LUA_TSTRING) {
+        Clay_String s = Clay_CopyLuaString(L, arg1);
+        uint32_t index = (uint32_t)luaL_optinteger(L, arg1 + 1, 0);
+        bool isLocal = lua_toboolean(L, arg1 + 2);
+
+        Clay_ElementId eid;
+        if (index > 0) {
+            eid = Clay__HashStringWithOffset(s, index, isLocal ? Clay__GetParentElementId() : 0);
+        } else {
+            eid = Clay__HashString(s, isLocal ? Clay__GetParentElementId() : 0);
+        }
+        clay__last_id = eid;
+        return eid;
+    }
+
+    luaL_error(L, "clay.element expects (string|idTable[, index[, isLocal]])");
+    return (Clay_ElementId){0};
+}
+
+static int l_Clay_ElementBuilder_New(lua_State *L) {
+    Clay_ElementId eid = clay_element_id_from_args(L, 1);
+
+    LuaClayElementBuilder *b = (LuaClayElementBuilder*)lua_newuserdata(L, sizeof(LuaClayElementBuilder));
+    memset(b, 0, sizeof(*b));
+    b->decl = (Clay_ElementDeclaration){0};
+    b->decl.layout = CLAY_LAYOUT_DEFAULT;
+    b->active = 1;
+    b->configured = 0;
+    b->clipOffsetExplicit = 0;
+
+    Clay__OpenElementWithId(eid);
+
+    luaL_setmetatable(L, "ClayElementBuilder");
+    return 1;
+}
+
+// --- ElementBuilder setters (return self) ---
+static int l_Elem_layoutDirection(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.layout.layoutDirection = (Clay_LayoutDirection)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_childGap(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.layout.childGap = (uint16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_childAlignment(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.layout.childAlignment.x = (Clay_LayoutAlignmentX)luaL_checkinteger(L, 2);
+    b->decl.layout.childAlignment.y = (Clay_LayoutAlignmentY)luaL_checkinteger(L, 3);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_padding(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    int n = lua_gettop(L) - 1;
+    if (n == 1) {
+        float all = (float)luaL_checknumber(L, 2);
+        b->decl.layout.padding.left = (uint16_t)all;
+        b->decl.layout.padding.right = (uint16_t)all;
+        b->decl.layout.padding.top = (uint16_t)all;
+        b->decl.layout.padding.bottom = (uint16_t)all;
+    } else if (n == 2) {
+        float x = (float)luaL_checknumber(L, 2);
+        float y = (float)luaL_checknumber(L, 3);
+        b->decl.layout.padding.left = (uint16_t)x;
+        b->decl.layout.padding.right = (uint16_t)x;
+        b->decl.layout.padding.top = (uint16_t)y;
+        b->decl.layout.padding.bottom = (uint16_t)y;
+    } else if (n == 4) {
+        float l = (float)luaL_checknumber(L, 2);
+        float t = (float)luaL_checknumber(L, 3);
+        float r = (float)luaL_checknumber(L, 4);
+        float bt = (float)luaL_checknumber(L, 5);
+        b->decl.layout.padding.left = (uint16_t)l;
+        b->decl.layout.padding.top = (uint16_t)t;
+        b->decl.layout.padding.right = (uint16_t)r;
+        b->decl.layout.padding.bottom = (uint16_t)bt;
+    } else {
+        return luaL_error(L, "padding(all) | padding(x,y) | padding(l,t,r,b)");
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
+static void set_sizing_axis(lua_State *L, Clay_SizingAxis *axis, Clay__SizingType type, int start_arg, int n_args) {
+    axis->type = type;
+    if (type == CLAY__SIZING_TYPE_FIXED) {
+        if (n_args != 1) luaL_error(L, "FIXED expects 1 argument (size)");
+        float size = (float)luaL_checknumber(L, start_arg);
+        axis->size.minMax.min = size;
+        axis->size.minMax.max = size;
+        return;
+    }
+    if (type == CLAY__SIZING_TYPE_PERCENT) {
+        if (n_args != 1) luaL_error(L, "PERCENT expects 1 argument (percent)");
+        axis->size.percent = (float)luaL_checknumber(L, start_arg);
+        return;
+    }
+    // FIT / GROW
+    if (n_args == 0) {
+        axis->size.minMax.min = 0.0f;
+        axis->size.minMax.max = 0.0f;
+    } else if (n_args == 1) {
+        axis->size.minMax.min = (float)luaL_checknumber(L, start_arg);
+        axis->size.minMax.max = 0.0f;
+    } else if (n_args == 2) {
+        axis->size.minMax.min = (float)luaL_checknumber(L, start_arg);
+        axis->size.minMax.max = (float)luaL_checknumber(L, start_arg + 1);
+    } else {
+        luaL_error(L, "GROW/FIT expects 0, 1, or 2 arguments (min[, max])");
+    }
+}
+
+static int l_Elem_width(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    Clay__SizingType t = (Clay__SizingType)luaL_checkinteger(L, 2);
+    int n = lua_gettop(L) - 2;
+    set_sizing_axis(L, &b->decl.layout.sizing.width, t, 3, n);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_height(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    Clay__SizingType t = (Clay__SizingType)luaL_checkinteger(L, 2);
+    int n = lua_gettop(L) - 2;
+    set_sizing_axis(L, &b->decl.layout.sizing.height, t, 3, n);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_backgroundColor(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.backgroundColor.r = (float)luaL_checknumber(L, 2);
+    b->decl.backgroundColor.g = (float)luaL_checknumber(L, 3);
+    b->decl.backgroundColor.b = (float)luaL_checknumber(L, 4);
+    b->decl.backgroundColor.a = (float)luaL_optnumber(L, 5, 255.0);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_cornerRadius(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    int n = lua_gettop(L) - 1;
+    if (n == 1) {
+        float r = (float)luaL_checknumber(L, 2);
+        b->decl.cornerRadius.topLeft = r;
+        b->decl.cornerRadius.topRight = r;
+        b->decl.cornerRadius.bottomLeft = r;
+        b->decl.cornerRadius.bottomRight = r;
+    } else if (n == 4) {
+        b->decl.cornerRadius.topLeft = (float)luaL_checknumber(L, 2);
+        b->decl.cornerRadius.topRight = (float)luaL_checknumber(L, 3);
+        b->decl.cornerRadius.bottomLeft = (float)luaL_checknumber(L, 4);
+        b->decl.cornerRadius.bottomRight = (float)luaL_checknumber(L, 5);
+    } else {
+        return luaL_error(L, "cornerRadius(all) | cornerRadius(tl,tr,bl,br)");
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_borderColor(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.border.color.r = (float)luaL_checknumber(L, 2);
+    b->decl.border.color.g = (float)luaL_checknumber(L, 3);
+    b->decl.border.color.b = (float)luaL_checknumber(L, 4);
+    b->decl.border.color.a = (float)luaL_optnumber(L, 5, 255.0);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_borderWidth(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    int n = lua_gettop(L) - 1;
+    if (n == 1) {
+        uint16_t w = (uint16_t)luaL_checkinteger(L, 2);
+        b->decl.border.width.left = w;
+        b->decl.border.width.right = w;
+        b->decl.border.width.top = w;
+        b->decl.border.width.bottom = w;
+    } else if (n == 4) {
+        b->decl.border.width.left = (uint16_t)luaL_checkinteger(L, 2);
+        b->decl.border.width.top = (uint16_t)luaL_checkinteger(L, 3);
+        b->decl.border.width.right = (uint16_t)luaL_checkinteger(L, 4);
+        b->decl.border.width.bottom = (uint16_t)luaL_checkinteger(L, 5);
+    } else {
+        return luaL_error(L, "borderWidth(all) | borderWidth(l,t,r,b)");
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_clip(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    int n = lua_gettop(L) - 1;
+    if (n == 1) {
+        bool v = lua_toboolean(L, 2);
+        b->decl.clip.horizontal = v;
+        b->decl.clip.vertical = v;
+    } else {
+        b->decl.clip.horizontal = lua_toboolean(L, 2);
+        b->decl.clip.vertical = lua_toboolean(L, 3);
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_clipHorizontal(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.clip.horizontal = lua_toboolean(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_clipVertical(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.clip.vertical = lua_toboolean(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_childOffset(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.clip.childOffset.x = (float)luaL_checknumber(L, 2);
+    b->decl.clip.childOffset.y = (float)luaL_checknumber(L, 3);
+    b->clipOffsetExplicit = 1;
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_aspectRatio(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.aspectRatio.aspectRatio = (float)luaL_checknumber(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_imageData(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    clay_set_ptr_from_lua(L, 2, &b->decl.image.imageData);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_customData(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    clay_set_ptr_from_lua(L, 2, &b->decl.custom.customData);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_userData(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    clay_set_ptr_from_lua(L, 2, &b->decl.userData);
+    lua_settop(L, 1);
+    return 1;
+}
+
+// Floating (field-like setters)
+static int l_Elem_attachTo(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.attachTo = (Clay_FloatingAttachToElement)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_attachPoints(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.attachPoints.element = (Clay_FloatingAttachPointType)luaL_checkinteger(L, 2);
+    b->decl.floating.attachPoints.parent = (Clay_FloatingAttachPointType)luaL_checkinteger(L, 3);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_offset(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.offset.x = (float)luaL_checknumber(L, 2);
+    b->decl.floating.offset.y = (float)luaL_checknumber(L, 3);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_expand(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.expand.width = (float)luaL_checknumber(L, 2);
+    b->decl.floating.expand.height = (float)luaL_checknumber(L, 3);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_parentId(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "id");
+        b->decl.floating.parentId = (uint32_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+    } else {
+        b->decl.floating.parentId = (uint32_t)luaL_checkinteger(L, 2);
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_zIndex(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.zIndex = (int16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_pointerCaptureMode(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.pointerCaptureMode = (Clay_PointerCaptureMode)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Elem_clipTo(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    b->decl.floating.clipTo = (Clay_FloatingClipToElement)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+// --- ElementBuilder:children(fn) ---
+static int l_Elem_children(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    // Apply config before running children, matching original wrapper behavior.
+    elem_builder_configure_if_needed(L, b);
+
+    // Push debug.traceback as error handler
+    lua_getglobal(L, "debug");
+    lua_getfield(L, -1, "traceback");
+    lua_remove(L, -2);
+    int traceback_index = lua_gettop(L);
+
+    lua_pushvalue(L, 2);
+    int status = lua_pcall(L, 0, 0, traceback_index);
+    if (status != LUA_OK) {
+        const char *err = lua_tostring(L, -1);
+        lua_pop(L, 1); // pop error
+        lua_pop(L, 1); // pop traceback function
+
+        Clay__CloseElement();
+        b->active = 0;
+        return luaL_error(L, "element children() failed:\n%s", err ? err : "(unknown)");
+    }
+
+    lua_pop(L, 1); // pop traceback function
+
+    Clay__CloseElement();
+    b->active = 0;
+    return 0;
+}
+
+// --- ElementBuilder:close() ---
+static int l_Elem_close(lua_State *L) {
+    LuaClayElementBuilder *b = check_elem_builder(L, 1);
+    elem_builder_ensure_open(L, b);
+    elem_builder_configure_if_needed(L, b);
+    Clay__CloseElement();
+    b->active = 0;
+    return 0;
+}
+
+// __gc: attempt to close unclosed elements to keep Clay stack consistent
+static int l_Elem_gc(lua_State *L) {
+    LuaClayElementBuilder *b = (LuaClayElementBuilder*)luaL_testudata(L, 1, "ClayElementBuilder");
+    if (!b) return 0;
+    if (b->active) {
+        // Best-effort: apply current config, then close.
+        // If this runs, the Lua reference was lost, so preventing an open-element leak is preferable.
+        elem_builder_configure_if_needed(L, b);
+        Clay__CloseElement();
+        b->active = 0;
+    }
+    return 0;
+}
+
+// --- Text Builder ---
+static int l_Clay_TextBuilder_New(lua_State *L) {
+    // Supports:
+    //   clay.text("hi"):fontSize(12):close()
+    // and auto-close variant:
+    //   clay.text("hi", function(t) t:fontSize(12) end)
+
+    LuaClayTextBuilder *t = (LuaClayTextBuilder*)lua_newuserdata(L, sizeof(LuaClayTextBuilder));
+    memset(t, 0, sizeof(*t));
+    t->text = Clay_CopyLuaString(L, 1);
+
+    // Defaults (match existing createTextElement)
+    t->cfg = (Clay_TextElementConfig){0};
+    t->cfg.fontId = 1;
+    t->cfg.fontSize = 16;
+    t->cfg.textColor = (Clay_Color){255,255,255,255};
+    t->cfg.wrapMode = CLAY_TEXT_WRAP_WORDS;
+    t->cfg.textAlignment = CLAY_TEXT_ALIGN_LEFT;
+    t->cfg.letterSpacing = 0;
+    t->cfg.lineHeight = 0;
+    t->cfg.userData = NULL;
+
+    t->active = 1;
+    luaL_setmetatable(L, "ClayTextBuilder");
+
+    if (lua_gettop(L) >= 2 && lua_isfunction(L, 2)) {
+        // Call config callback with (builder)
+        lua_getglobal(L, "debug");
+        lua_getfield(L, -1, "traceback");
+        lua_remove(L, -2);
+        int traceback_index = lua_gettop(L);
+
+        lua_pushvalue(L, 2); // function
+        lua_pushvalue(L, -3); // builder userdata
+
+        if (lua_pcall(L, 1, 0, traceback_index) != LUA_OK) {
+            const char *err = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            lua_pop(L, 1);
+            return luaL_error(L, "text() config callback failed:\n%s", err ? err : "(unknown)");
+        }
+
+        lua_pop(L, 1); // pop traceback
+
+        // Auto emit
+        text_builder_emit(t);
+        return 0;
+    }
+
+    return 1;
+}
+
+static void text_builder_detach_ptrs(LuaClayTextBuilder *t) {
+    t->cfg.userData = NULL;
+}
+
+static int l_Text_userData(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    clay_set_ptr_from_lua(L, 2, &t->cfg.userData);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_textColor(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.textColor.r = (float)luaL_checknumber(L, 2);
+    t->cfg.textColor.g = (float)luaL_checknumber(L, 3);
+    t->cfg.textColor.b = (float)luaL_checknumber(L, 4);
+    t->cfg.textColor.a = (float)luaL_optnumber(L, 5, 255.0);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_fontId(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.fontId = (uint16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_fontSize(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.fontSize = (uint16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_letterSpacing(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.letterSpacing = (uint16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_lineHeight(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.lineHeight = (uint16_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_wrapMode(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.wrapMode = (Clay_TextElementConfigWrapMode)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_textAlignment(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return luaL_error(L, "text builder is not active (already done?)");
+    t->cfg.textAlignment = (Clay_TextAlignment)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int l_Text_close(lua_State *L) {
+    LuaClayTextBuilder *t = check_text_builder(L, 1);
+    if (!t->active) return 0;
+
+    text_builder_emit(t);
+    return 0;
+}
+
+// Alias for older name (some people prefer :done())
+static int l_Text_done(lua_State *L) {
+    return l_Text_close(L);
+}
+
+static int l_Text_gc(lua_State *L) {
+    LuaClayTextBuilder *t = (LuaClayTextBuilder*)luaL_testudata(L, 1, "ClayTextBuilder");
+    if (!t) return 0;
+    if (t->active) {
+        // Builder never done -> prevent leaking tagged ref
+        clay_unref_tagged(L, &t->cfg.userData);
+        t->active = 0;
+    }
+    return 0;
+}
+
+static void Clay_CreateElementBuilderMetatable(lua_State *L) {
+    if (luaL_newmetatable(L, "ClayElementBuilder")) {
+        lua_pushcfunction(L, l_Elem_layoutDirection); lua_setfield(L, -2, "layoutDirection");
+        lua_pushcfunction(L, l_Elem_childGap); lua_setfield(L, -2, "childGap");
+        lua_pushcfunction(L, l_Elem_childAlignment); lua_setfield(L, -2, "childAlignment");
+        lua_pushcfunction(L, l_Elem_padding); lua_setfield(L, -2, "padding");
+        lua_pushcfunction(L, l_Elem_width); lua_setfield(L, -2, "width");
+        lua_pushcfunction(L, l_Elem_height); lua_setfield(L, -2, "height");
+        lua_pushcfunction(L, l_Elem_backgroundColor); lua_setfield(L, -2, "backgroundColor");
+        lua_pushcfunction(L, l_Elem_cornerRadius); lua_setfield(L, -2, "cornerRadius");
+        lua_pushcfunction(L, l_Elem_borderColor); lua_setfield(L, -2, "borderColor");
+        lua_pushcfunction(L, l_Elem_borderWidth); lua_setfield(L, -2, "borderWidth");
+        lua_pushcfunction(L, l_Elem_clip); lua_setfield(L, -2, "clip");
+        lua_pushcfunction(L, l_Elem_clipHorizontal); lua_setfield(L, -2, "clipHorizontal");
+        lua_pushcfunction(L, l_Elem_clipVertical); lua_setfield(L, -2, "clipVertical");
+        lua_pushcfunction(L, l_Elem_childOffset); lua_setfield(L, -2, "childOffset");
+        lua_pushcfunction(L, l_Elem_aspectRatio); lua_setfield(L, -2, "aspectRatio");
+        lua_pushcfunction(L, l_Elem_imageData); lua_setfield(L, -2, "imageData");
+        lua_pushcfunction(L, l_Elem_customData); lua_setfield(L, -2, "customData");
+        lua_pushcfunction(L, l_Elem_userData); lua_setfield(L, -2, "userData");
+
+        lua_pushcfunction(L, l_Elem_attachTo); lua_setfield(L, -2, "attachTo");
+        lua_pushcfunction(L, l_Elem_attachPoints); lua_setfield(L, -2, "attachPoints");
+        lua_pushcfunction(L, l_Elem_offset); lua_setfield(L, -2, "offset");
+        lua_pushcfunction(L, l_Elem_expand); lua_setfield(L, -2, "expand");
+        lua_pushcfunction(L, l_Elem_parentId); lua_setfield(L, -2, "parentId");
+        lua_pushcfunction(L, l_Elem_zIndex); lua_setfield(L, -2, "zIndex");
+        lua_pushcfunction(L, l_Elem_pointerCaptureMode); lua_setfield(L, -2, "pointerCaptureMode");
+        lua_pushcfunction(L, l_Elem_clipTo); lua_setfield(L, -2, "clipTo");
+
+        lua_pushcfunction(L, l_Elem_children); lua_setfield(L, -2, "children");
+        lua_pushcfunction(L, l_Elem_close); lua_setfield(L, -2, "close");
+
+        lua_pushcfunction(L, l_Elem_gc); lua_setfield(L, -2, "__gc");
+        lua_pushvalue(L, -1); lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+}
+
+static void Clay_CreateTextBuilderMetatable(lua_State *L) {
+    if (luaL_newmetatable(L, "ClayTextBuilder")) {
+        lua_pushcfunction(L, l_Text_userData); lua_setfield(L, -2, "userData");
+        lua_pushcfunction(L, l_Text_textColor); lua_setfield(L, -2, "textColor");
+        lua_pushcfunction(L, l_Text_fontId); lua_setfield(L, -2, "fontId");
+        lua_pushcfunction(L, l_Text_fontSize); lua_setfield(L, -2, "fontSize");
+        lua_pushcfunction(L, l_Text_letterSpacing); lua_setfield(L, -2, "letterSpacing");
+        lua_pushcfunction(L, l_Text_lineHeight); lua_setfield(L, -2, "lineHeight");
+        lua_pushcfunction(L, l_Text_wrapMode); lua_setfield(L, -2, "wrapMode");
+        lua_pushcfunction(L, l_Text_textAlignment); lua_setfield(L, -2, "textAlignment");
+        lua_pushcfunction(L, l_Text_close); lua_setfield(L, -2, "close");
+        lua_pushcfunction(L, l_Text_done); lua_setfield(L, -2, "done");
+        lua_pushcfunction(L, l_Text_gc); lua_setfield(L, -2, "__gc");
+        lua_pushvalue(L, -1); lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+}
+
 // -----------------------------------------------------------------------------
 // Core API wrappers
 // -----------------------------------------------------------------------------
@@ -1407,6 +2142,10 @@ int luaopen_clay(lua_State *L) {
     lua_pushcfunction(L, l_Clay_EndLayoutIter); lua_setfield(L, -2, "endLayoutIter");
     lua_pushcfunction(L, l_Clay_CreateElement); lua_setfield(L, -2, "createElement");
     lua_pushcfunction(L, l_Clay_CreateTextElement); lua_setfield(L, -2, "createTextElement");
+
+    // Fluent builders (no table churn)
+    lua_pushcfunction(L, l_Clay_ElementBuilder_New); lua_setfield(L, -2, "element");
+    lua_pushcfunction(L, l_Clay_TextBuilder_New); lua_setfield(L, -2, "text");
     lua_pushcfunction(L, l_Clay_Id); lua_setfield(L, -2, "id");
     lua_pushcfunction(L, l_Clay_GetLastElementId); lua_setfield(L, -2, "getLastElementId");
     lua_pushcfunction(L, l_Clay_OpenElement); lua_setfield(L, -2, "open");
@@ -1472,6 +2211,12 @@ int luaopen_clay(lua_State *L) {
     lua_pushinteger(L, CLAY__SIZING_TYPE_FIXED); lua_setfield(L, -2, "SIZING_FIXED");
     lua_pushinteger(L, CLAY__SIZING_TYPE_PERCENT); lua_setfield(L, -2, "SIZING_PERCENT");
 
+    // Aliases (match user's preferred naming)
+    lua_pushinteger(L, CLAY__SIZING_TYPE_FIT); lua_setfield(L, -2, "SIZING_TYPE_FIT");
+    lua_pushinteger(L, CLAY__SIZING_TYPE_GROW); lua_setfield(L, -2, "SIZING_TYPE_GROW");
+    lua_pushinteger(L, CLAY__SIZING_TYPE_FIXED); lua_setfield(L, -2, "SIZING_TYPE_FIXED");
+    lua_pushinteger(L, CLAY__SIZING_TYPE_PERCENT); lua_setfield(L, -2, "SIZING_TYPE_PERCENT");
+
     // Export layout align constants
     lua_pushinteger(L, CLAY_ALIGN_X_LEFT); lua_setfield(L, -2, "ALIGN_X_LEFT");
     lua_pushinteger(L, CLAY_ALIGN_X_CENTER); lua_setfield(L, -2, "ALIGN_X_CENTER");
@@ -1488,6 +2233,11 @@ int luaopen_clay(lua_State *L) {
     lua_pushinteger(L, CLAY_TEXT_WRAP_NONE); lua_setfield(L, -2, "TEXT_WRAP_NONE");
     lua_pushinteger(L, CLAY_TEXT_WRAP_WORDS); lua_setfield(L, -2, "TEXT_WRAP_WORDS");
     lua_pushinteger(L, CLAY_TEXT_WRAP_NEWLINES); lua_setfield(L, -2, "TEXT_WRAP_NEWLINES");
+
+    // Aliases (shorter)
+    lua_pushinteger(L, CLAY_TEXT_WRAP_NONE); lua_setfield(L, -2, "WRAP_MODE_NONE");
+    lua_pushinteger(L, CLAY_TEXT_WRAP_WORDS); lua_setfield(L, -2, "WRAP_MODE_WORDS");
+    lua_pushinteger(L, CLAY_TEXT_WRAP_NEWLINES); lua_setfield(L, -2, "WRAP_MODE_NEWLINES");
 
     // Export layout direction constants
     lua_pushinteger(L, CLAY_LEFT_TO_RIGHT); lua_setfield(L, -2, "LEFT_TO_RIGHT");
@@ -1520,6 +2270,10 @@ int luaopen_clay(lua_State *L) {
 
 	// Creates the metatables for render command parsing
 	Clay_CreateCommandMetatable(L);
+
+	// Creates the metatables for fluent builders
+	Clay_CreateElementBuilderMetatable(L);
+	Clay_CreateTextBuilderMetatable(L);
 
     return 1;
 }
