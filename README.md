@@ -3,9 +3,6 @@
 A small **Lua wrapper** module around the single‑header layout engine **Clay** (written in C).  
 This is **not** an FFI binding; it is a compiled Lua C module that exposes a Lua‑friendly API for declaring elements, running layout, and iterating the resulting render commands.
 
-> ⚠️ **Important difference (Lua clip + scroll):**  
-> When creating a scrollable container, **omit** `clip.childOffset` in Lua if you want Clay’s current scroll position to be used. The wrapper will automatically read `Clay_GetScrollOffset()` for you whenever `clip.horizontal` or `clip.vertical` is set and `childOffset` is missing. In vanilla C you would typically pass `childOffset = Clay_GetScrollOffset()` explicitly.
-
 ---
 
 ## Features
