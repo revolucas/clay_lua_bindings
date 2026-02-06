@@ -45,6 +45,17 @@ static Clay_String Clay_CopyLuaString(lua_State *L, int index) {
     return Clay__WriteStringToCharBuffer(&ctx->dynamicStringData, tmp);
 }
 
+// Borrow Lua string memory (no Clay allocations). Safe for immediate hashing calls.
+static inline Clay_String Clay_BorrowLuaString(lua_State *L, int index) {
+    size_t len = 0;
+    const char *txt = luaL_checklstring(L, index, &len);
+    Clay_String s = {0};
+    s.chars = txt;
+    s.length = (int32_t)len;
+    s.isStaticallyAllocated = true; // important: don't assume Clay owns this
+    return s;
+}
+
 static inline int clay_is_ref_tag(void *p) {
     return ((uintptr_t)p & (uintptr_t)1u) != 0;
 }
@@ -480,7 +491,11 @@ static Clay_ElementId clay_check_element_id(lua_State *L, int idx)
     eid.baseId = (uint32_t)luaL_optinteger(L, -1, 0);
     lua_pop(L, 1);
 
-    // stringId (optional)
+    // stringId
+    lua_getfield(L, idx, "stringId");
+    lua_pop(L, 1);
+
+    /*
     lua_getfield(L, idx, "stringId");
     if (lua_type(L, -1) == LUA_TSTRING) {
         Clay_String s = Clay_CopyLuaString(L, -1);
@@ -489,6 +504,7 @@ static Clay_ElementId clay_check_element_id(lua_State *L, int idx)
         // leave eid.stringId zeroed; treat as absent
     }
     lua_pop(L, 1);
+    */
 
     return eid;
 }
@@ -564,7 +580,7 @@ static Clay_ElementId clay_element_id_from_args(lua_State *L, int arg1) {
         return clay_check_element_id(L, arg1);
     }
     if (t == LUA_TSTRING) {
-        Clay_String s = Clay_CopyLuaString(L, arg1);
+        Clay_String s = Clay_BorrowLuaString(L, 1);
         uint32_t index = (uint32_t)luaL_optinteger(L, arg1 + 1, 0);
         bool isLocal = lua_toboolean(L, arg1 + 2);
 
@@ -1359,7 +1375,7 @@ static void clay_push_element_id_table(lua_State *L, Clay_ElementId eid, Clay_St
 }
 
 static int l_Clay_Id(lua_State *L) {
-	Clay_String s = Clay_CopyLuaString(L, 1);
+	Clay_String s = Clay_BorrowLuaString(L, 1);
     uint32_t index = (uint32_t)luaL_optinteger(L, 2, 0);
     bool isLocal = lua_toboolean(L, 3);
 
@@ -1384,6 +1400,33 @@ static int l_Clay_Id(lua_State *L) {
     return 1;
 }
 
+static int l_Clay_AutoId(lua_State *L) {
+    Clay_Context *ctx = Clay_GetCurrentContext();
+    if (!ctx) return luaL_error(L, "Clay context is null (did you call clay.initialize()?)");
+
+    // We need to be inside a layout with an open parent element (after beginLayout()).
+    // openLayoutElementStack includes the current open element(s). The root is opened by Clay_BeginLayout.
+    if (ctx->openLayoutElementStack.length < 1) {
+        return luaL_error(L, "clay.autoId() must be called during a layout pass (after clay.beginLayout())");
+    }
+
+    // Current parent is the currently open layout element
+    Clay_LayoutElement *parent = Clay__GetOpenLayoutElement();
+    if (!parent) {
+        return luaL_error(L, "clay.autoId() has no open parent element");
+    }
+
+    uint32_t offset = (uint32_t)(parent->childrenOrTextContent.children.length + parent->floatingChildrenCount);
+
+    // Local-by-default: base hash is parent->id
+    Clay_ElementId eid = Clay__HashNumber(offset, parent->id);
+
+    clay__last_id = eid;
+
+    // Return id table. No stringId (Option A philosophy).
+    clay_push_element_id_table(L, eid, (Clay_String){0});
+    return 1;
+}
 
 static int l_Clay_GetLastElementId(lua_State *L) {
     Clay_ElementId eid = clay__last_id;
@@ -1393,7 +1436,7 @@ static int l_Clay_GetLastElementId(lua_State *L) {
 
 
 static int l_Clay_GetElementId(lua_State *L) {
-    Clay_String s = Clay_CopyLuaString(L, 1);
+    Clay_String s = Clay_BorrowLuaString(L, 1);
     Clay_ElementId eid = Clay_GetElementId(s);
     clay_push_element_id_table(L, eid, (Clay_String){0});
     return 1;
@@ -1401,7 +1444,7 @@ static int l_Clay_GetElementId(lua_State *L) {
 
 
 static int l_Clay_GetElementIdWithIndex(lua_State *L) {
-    Clay_String s = Clay_CopyLuaString(L, 1);
+    Clay_String s = Clay_BorrowLuaString(L, 1);
     uint32_t index = (uint32_t)luaL_checkinteger(L, 2);
     Clay_ElementId eid = Clay_GetElementIdWithIndex(s, index);
     clay_push_element_id_table(L, eid, (Clay_String){0});
@@ -2147,6 +2190,7 @@ int luaopen_clay(lua_State *L) {
     lua_pushcfunction(L, l_Clay_ElementBuilder_New); lua_setfield(L, -2, "element");
     lua_pushcfunction(L, l_Clay_TextBuilder_New); lua_setfield(L, -2, "text");
     lua_pushcfunction(L, l_Clay_Id); lua_setfield(L, -2, "id");
+    lua_pushcfunction(L, l_Clay_AutoId); lua_setfield(L, -2, "autoId");
     lua_pushcfunction(L, l_Clay_GetLastElementId); lua_setfield(L, -2, "getLastElementId");
     lua_pushcfunction(L, l_Clay_OpenElement); lua_setfield(L, -2, "open");
     lua_pushcfunction(L, l_Clay_ConfigureElement); lua_setfield(L, -2, "configure");
