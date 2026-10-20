@@ -3,12 +3,18 @@
 A small **Lua wrapper** module around the single‑header layout engine **Clay** (written in C).  
 This is **not** an FFI binding; it is a compiled Lua C module that exposes a Lua‑friendly API for declaring elements, running layout, and iterating the resulting render commands.
 
+This file documents the native binding. Technetium layers retained roots,
+themes, and reusable widgets on top of it; see Technetium's
+`ClayBuilderAPI.md` for those higher-level APIs. For new UI, prefer the fluent
+builder methods and automatic IDs described below over older named/indexed
+element patterns.
+
 ---
 
 ## Features
 
 - Lightweight Lua API mirroring Clay’s core functionality (context/init, element declaration, scrolling, pointer state).
-- Helpers for sizing, padding, IDs, and text configuration to keep layout declarations concise.
+- Allocation-light fluent builders for element layout, text, sizing, padding, colors, and floating overlays.
 - A **layout end iterator** that yields typed `ClayCommand` objects per render command (rectangles, text, images, borders, scissor start/end, custom).
 
 ---
@@ -34,7 +40,24 @@ local clay = require("clay")
 local arena_mem, ctx = clay.initialize(clay.minMemorySize(), 1280, 720)
 ```
 
-Call `clay.setLayoutDimensions(width, height)`, `clay.setPointerState({x,y}, isDown)`, and `clay.updateScrollContainers(enableDrag, {x=dx,y=dy}, dt)` once per frame as appropriate.
+Call `clay.setLayoutDimensions(width, height)`, `clay.setPointerState(x, y, isDown)`, and `clay.updateScrollContainers(enableDrag, scrollX, scrollY, dt)` once per frame as appropriate.
+
+### Text measurement callbacks
+
+Register one callback to provide text dimensions. Clay passes text and its style
+fields as scalar arguments, avoiding a configuration table allocation for each
+measurement:
+
+```lua
+clay.setMeasureTextFunction(function(
+  text, fontId, fontSize, letterSpacing, lineHeight,
+  wrapMode, textAlignment, r, g, b, a
+)
+  return width, height
+end)
+```
+
+Passing `nil` clears the callback and uses the default measurement.
 
 ---
 
@@ -56,17 +79,17 @@ clay.updateScrollContainers(true, scroll_dx, scroll_dy, dt)
 
 clay.beginLayout()
 
-clay.element("Root")
-  :width(clay.SIZING_FIXED, w)
-  :height(clay.SIZING_FIXED, h)
-  :children(function()
-    clay.text("Hello World")
-      :fontSize(16)
-      :done()
-  end)
+clay.element()
+  :wGrow()
+  :hGrow()
+  :open()
+clay.text("Hello World")
+  :fontSize(16)
+  :close()
+clay.close()
 
-for cmd in clay.endLayoutIter() do
-  -- renderer consumes cmd
+for command in clay.endLayoutFast() do
+  -- renderer consumes command
 end
 ```
 
@@ -77,18 +100,40 @@ end
 ### Signatures
 
 ```lua
--- Common usage
-local e = clay.element("Name" [, index [, isLocal]])
+-- Default: an anonymous element gets an automatic hierarchical ID.
+local spacer = clay.element()
+local generatedId = spacer:id()
+spacer:close()
 
--- Advanced: explicit id table
-local eid = clay.id("Name", index, isLocal)
-local e = clay.element(eid)
+-- Give it a named ID only when another call must address it.
+local viewportId = clay.id("AssetViewport")
+clay.element(viewportId):wGrow():hGrow():clip(true, true):open()
+clay.close()
+
+-- Scope anonymous IDs by stable data identity when rows may reorder.
+for i = 1, #items do
+  local item = items[i]
+  clay.keyed(item.id, function()
+    clay.element():wGrow():h(28):open()
+      clay.text(item.name):close()
+    clay.close()
+  end)
+end
 ```
 
-**Parameters**
-- `Name` (string): base name used for hashing the element id
-- `index` (number, optional): for repeated elements (e.g. list rows)
-- `isLocal` (boolean, optional): if true, the id is hashed relative to the parent element id
+Use `clay.element()` without arguments for ordinary layout. Its ID is derived
+from the current parent and declaration order; read it with `:id()` when needed.
+Use `clay.id(name, ...)` for an ID that must be created before its element or
+referenced outside its declaration. For repeated anonymous children whose order
+can change, wrap each item in `clay.keyed(stableKey, fn)`.
+
+The fluent builder API is the element declaration API. Use `:open()` plus one
+matching `clay.close()` for parents, `:close()` for leaves, and `:floating()` for
+floating-only settings. There is no `clay.element(nil)` form, callback-style
+`:children()`, standalone `clay.autoId()`, or hidden `clay.getLastElementId()`
+lookup. The older named/indexed `clay.element(name, index, isLocal)` signature
+is still supported for compatibility; prefer automatic IDs and keyed scopes in
+new code.
 
 ---
 
@@ -96,10 +141,10 @@ local e = clay.element(eid)
 
 Calling `clay.element(...)` **immediately opens an element** in Clay.
 
-You must close it using one of the following:
+Finish configuring it, then use one of the following:
 
-- `:children(function() ... end)` — runs children and auto-closes
 - `:close()` — closes immediately (leaf element)
+- `:open()` — finishes the element declaration and keeps it on Clay's stack while you declare children. Close it later with `clay.close()`.
 
 If an element is garbage-collected while still open, the builder’s `__gc` will attempt a best-effort close to keep Clay’s internal stack consistent. This is a safety net, not a control flow mechanism.
 
@@ -112,6 +157,15 @@ All builder methods return `self` so they can be chained.
 ---
 
 ### Layout
+
+Common shorthand methods:
+
+```lua
+:row() :col()
+:gap(px)                   -- alias for childGap
+:align(x, y)               -- alias for childAlignment
+:alignLT() :alignCC() :alignRB() -- all nine alignment combinations are available
+```
 
 #### `:layoutDirection(dir)`
 
@@ -176,9 +230,33 @@ Argument rules:
   - one arg → min
   - two args → min, max
 
+Paired shorthand methods configure both axes:
+
+```lua
+:size(width, height)                               -- fixed on both axes
+:growSize(widthMin, widthMax, heightMin, heightMax)
+:fitSize(widthMin, widthMax, heightMin, heightMax)
+:percentSize(widthPercent, heightPercent)
+```
+
+For `size` and `percentSize`, a `nil` axis is left unchanged. For `growSize` and
+`fitSize`, omitted or `nil` bounds default to zero, matching the per-axis
+GROW/FIT defaults.
+
 ---
 
 ### Visuals
+
+Element `:backgroundColor()` and `:borderColor()` take separate `r, g, b, a`
+numbers (alpha may be omitted). Text `:textColor()` also accepts a packed
+`0xRRGGBBAA` value or an `{r, g, b, a}` / keyed color table. A single `nil`
+leaves the current value unchanged where supported.
+
+```lua
+:backgroundColor(48, 48, 48, 255)
+:borderColor(255, 255, 255, 96)
+:borderWidth(1)
+```
 
 #### `:backgroundColor(r, g, b [, a])`
 
@@ -189,6 +267,29 @@ RGBA values (floats).
 #### `:borderColor(r, g, b [, a])`
 
 #### `:borderWidth(all)` or `:borderWidth(l, t, r, b)`
+
+#### `:transition(duration, property, ...)`
+
+Enables Clay's built-in ease-out transition handler for the named properties.
+Elements need a stable ID and must be declared each frame for their transition
+state to continue.
+
+```lua
+clay.element("AnimatedPanel")
+  :width(clay.SIZING_FIXED, expanded and 280 or 220)
+  :backgroundColor(48, 56, 72, 255)
+  :transition(0.2, "width", "backgroundColor")
+  :open()
+-- Declare children here, then close the panel.
+clay.close()
+```
+
+Supported property names are `x`, `y`, `position`, `width`, `height`,
+`dimensions`, `boundingBox`, `backgroundColor`, `overlayColor`, `borderColor`,
+`borderWidth`, and `border`. Entry/exit callbacks and custom easing handlers are
+not exposed by the Lua builder yet. This upstream revision does not carry
+corner-radius or text-color values in its transition data, so those cannot be
+animated through this method.
 
 ---
 
@@ -234,26 +335,41 @@ If a non-lightuserdata Lua value is passed, it is stored in the Lua registry and
 
 ### Floating / overlays
 
-Maps directly to `decl.floating.*`:
+Floating settings have their own builder. `:floating()` defaults to attaching to
+the parent; choose `:root()` or `:to(id)` when the overlay belongs elsewhere.
+Call `:done()` to return to the element builder before setting its layout or
+render properties.
 
-- `:attachTo(mode)`
-- `:attachPoints(elementPoint, parentPoint)`
-- `:offset(x, y)`
-- `:expand(w, h)`
-- `:parentId(idOrNumber)`
-- `:zIndex(z)`
-- `:pointerCaptureMode(mode)`
-- `:clipTo(mode)`
+```lua
+clay.element("Tooltip")
+  :floating()
+    :to(clay.id("SettingsButton"))
+    :attach("lt", "rb")
+    :offset(8, 6)
+    :zIndex(100)
+    :done()
+  :width(clay.SIZING_FIXED, 160)
+  :height(clay.SIZING_FIT)
+  :padding(6, 4)
+  :open()
+clay.text("Settings"):close()
+clay.close()
+```
+
+The floating builder supports `:parent()`, `:root()`, `:to(idOrInteger)`,
+`:attach(elementPoint, parentPoint)`, `:offset(x, y)`, `:expand(w, h)`,
+`:zIndex(n)`, `:pointerCapture(bool)`, `:pointerCaptureMode(mode)`,
+`:clipTo(mode)`, `:clipToParent(bool)`, and `:done()`.
+
+Keep floating placement inside `:floating()` so its attachment, offset, clipping,
+pointer capture, and z-order are configured as one nested group.
 
 ---
 
-### Closing and children
+### Closing and nesting
 
-#### `:children(fn)`
-
-Applies configuration, executes `fn()`, then closes the element.
-
-Errors are wrapped with `debug.traceback` and the element is closed before rethrowing.
+Use `:open()` on a parent, declare its children, then call `clay.close()` to close
+the parent. Use `:close()` for a leaf element.
 
 #### `:close()`
 
@@ -263,19 +379,26 @@ Applies configuration (if needed) and closes immediately.
 
 ## Fluent text builder: `clay.text(...)`
 
-### Signatures
+Use the fluent builder for new code:
 
 ```lua
 clay.text("Hello")
   :fontSize(16)
   :textColor(255,255,255,255)
-  :done()
+  :close()
+```
 
--- Callback form (auto-emits)
+The callback form still works for existing callers and emits the text after the
+callback returns. Positional font/style arguments are also supported for
+compatibility; fluent setters are easier to extend and read:
+
+```lua
 clay.text("Hello", function(t)
   t:fontSize(16)
   t:textAlignment(clay.TEXT_ALIGN_CENTER)
 end)
+
+clay.text("Hello", fontId, fontSize, color, alignment, wrapMode):close()
 ```
 
 ### Defaults
@@ -327,35 +450,42 @@ end
 
 If the payload was a Lua value (not lightuserdata), calling the accessor releases the registry reference and clears the pointer.
 
+For render loops that read several properties from every command, `endLayoutFast()` returns the common render properties as a fixed tuple in one C call and does not allocate one `ClayCommand` userdata per command. Use `endLayoutIter()` when you also need command IDs, z-indices, or user data:
+
+```lua
+for t, x, y, w, h, r, g, b, a, tl, tr, bl, br, left, right, top, bottom,
+    text, fontId, fontSize, letterSpacing, lineHeight, payload, clipH, clipV
+    in clay.endLayoutFast() do
+  if t == clay.RENDER_RECTANGLE then
+    -- Use bounds, color, and corner radii.
+  elseif t == clay.RENDER_TEXT then
+    -- Use bounds, color, text, and font fields.
+  elseif t == clay.RENDER_IMAGE then
+    -- Use bounds, corner radii, and payload.
+  elseif t == clay.RENDER_SCISSOR_START then
+    -- Use bounds and clipH/clipV.
+  end
+end
+```
+
+The slots are always in this order: `type, x, y, width, height, r, g, b, a, topLeft, topRight, bottomLeft, bottomRight, borderLeft, borderRight, borderTop, borderBottom, text, fontId, fontSize, letterSpacing, lineHeight, payload, clipHorizontal, clipVertical`. Fields that do not apply to a command are `nil`. For image and custom commands, `payload` follows the same one-shot Lua-value transfer behavior as `cmd:imageData()` and `cmd:customData()`.
+
 ---
 
-## Migration guide
-
-### Old API
+## Builder patterns
 
 ```lua
-clay.createElement(id, decl, function()
-  clay.createTextElement("Hello", {fontSize=16})
-end)
-```
+-- Parent with nested children
+clay.element():col():open()
+clay.text("Hello")
+  :fontSize(16)
+  :close()
+clay.close()
 
-### Builder API
-
-```lua
-clay.element("MyElement")
-  :children(function()
-    clay.text("Hello")
-      :fontSize(16)
-      :done()
-  end)
-```
-
-### Leaf elements
-
-```lua
-clay.element("Spacer")
-  :width(clay.SIZING_GROW)
-  :height(clay.SIZING_FIXED, 2)
+-- Leaf element
+clay.element()
+  :wGrow()
+  :h(2)
   :close()
 ```
 
@@ -363,32 +493,36 @@ clay.element("Spacer")
 
 ## Best practices
 
-- Prefer `:children()` for elements with children
+- Use `:open()` and `clay.close()` for parent elements
 - Prefer `:close()` for leaf elements
 - Do not rely on `__gc` to close elements
 - Treat `cmd:imageData()`, `cmd:customData()`, and `cmd:userData()` as **one-shot** when using Lua values
-- Use `clay.id(name, index)` for interactive or queryable elements
-- Use `isLocal=true` in reusable components to avoid id collisions
+- Let the builder assign IDs for normal layout elements; use `builder:id()` when a later call needs that generated ID
+- Use `clay.id(name, ...)` only when code needs a stable named ID before declaration or external reference
+- Use `clay.keyed(stableKey, fn)` for anonymous repeated children that may be inserted, removed, or reordered
+- Avoid positional `index` / `isLocal` ID schemes in new reusable components; their identity rules are less clear than hierarchical IDs and keyed scopes
 
 ---
 
-## **The Layout End Iterator**
+## **The Layout End Iterators**
 
-`for cmd in clay.endLayoutIter() do ... end`
+`for cmd in clay.endLayoutIter(dt) do ... end` or `for ... in clay.endLayoutFast(dt) do ... end`
 
 ### What it does
-- Finalizes the current frame’s layout by calling Clay’s internal `Clay_EndLayout()`.
+- Finalizes the current frame’s layout by calling Clay’s internal `Clay_EndLayout(deltaTime)`.
+- `dt` is seconds since the previous frame and advances Clay transitions. It is optional for compatibility and defaults to `0`.
 - Returns a **closure iterator** over a stable array of render commands for that frame.
-- Each iteration yields a `ClayCommand` userdata with methods to inspect the command.
+- `endLayoutIter()` yields a `ClayCommand` userdata with methods to inspect the command.
+- `endLayoutFast()` yields a fixed tuple of render fields without allocating a command userdata.
 
 ### Why this pattern?
 - It keeps Lua code ergonomic and avoids copying the command array.
 - It lets you write idiomatic `for ... in` loops to drive your renderer.
 
 ### Iterator lifecycle rules
-1. **Call order**: Always `beginLayout()` → declare elements → `endLayoutIter()` (then iterate). You cannot add more elements after calling `endLayoutIter()` for that frame.
+1. **Call order**: Always `beginLayout()` → declare elements → either `endLayoutIter()` or `endLayoutFast()` (then iterate). You cannot add more elements after calling either iterator for that frame.
 2. **Lifetime**: The yielded `ClayCommand` objects are only valid during the same frame. Don’t store them across frames; if you must cache, copy the primitive fields you need.
-3. **One iterator per frame**: Call `endLayoutIter()` once per frame to consume the results. If you need multiple passes, store the commands you care about in your own structures during the first iteration.
+3. **One iterator per frame**: Call one iterator once per frame to consume the results. If you need multiple passes, store the commands you care about in your own structures during the first iteration.
 4. **Culling & scissor**: If you enable culling (`clay.setCullingEnabled(true)`), expect fewer commands. Scissor commands (clip start/end) will appear and should be respected by your renderer.
 
 ### `ClayCommand` API
@@ -461,18 +595,18 @@ So a **second call** in the **same frame** will return `nil`. If you need the va
 ## IDs & Helpers
 
 - `clay.id(label, index?, isLocal?) -> idTable`  
-  Use with `createElement` to produce stable IDs.  
-- `clay.sizingFixed(w)`, `clay.sizingFit(min?, max?)`, `clay.sizingGrow(min?, max?)`, `clay.sizingPercent(p)`  
-- `clay.paddingAll(p)`, `clay.paddingXY(x, y)`, `clay.paddingLTRB(l,t,r,b)`
+  Create an explicit ID for `clay.element(id)` or a floating target. Element declaration option tables are not part of the API.
+- `builder:id() -> idTable` returns the ID assigned to that element, including IDs generated by `clay.element()`.
+- `clay.keyed(key, fn)` scopes automatic IDs inside a repeated region so entries keep their IDs when reordered.
 
 ---
 
 ## Pointer, Hover & Scrolling
 
-- `clay.setPointerState({x, y}, pointerDown)`  
+- `clay.setPointerState(x, y, pointerDown)`
 - `clay.hovered() -> boolean`  
 - `clay.pointerOver(id) -> boolean`  
-- `clay.updateScrollContainers(enableDrag, {x, y}, deltaTime)`  
+- `clay.updateScrollContainers(enableDrag, scrollX, scrollY, deltaTime)`
 - `clay.getScrollOffset() -> {x, y}` (current open container)  
 - `clay.getScrollContainerData(id) -> table` (dimensions, content, config, position)  
 - `clay.setScrollOffset(id, x, y)` (programmatic scrolling)
